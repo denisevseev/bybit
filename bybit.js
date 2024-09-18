@@ -111,7 +111,7 @@ function processTicker(ticker) {
             const message = `
 <b>Вход в сделку (${directionText}):</b> ${formattedSymbol}
 Цена входа: <b>${currentPrice}</b>
-<a href="https://www.binance.com/ru/trade/${formattedSymbol}?layout=pro">Открыть в Binance</a>
+<a href="https://www.binance.com/ru/trade/${formattedSymbol}?type=spot">Открыть в Binance</a>
 `;
             bot.sendMessage(chatId, message, { parse_mode: 'HTML' }).catch((error) => {
                 console.error('Ошибка при отправке сообщения в Telegram:', error.message);
