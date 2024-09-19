@@ -107,7 +107,7 @@ function processTicker(ticker) {
 
             // Отправляем уведомление о входе в сделку
             const directionText = pairData.direction === 'up' ? '📈 Покупка' : '📉 Продажа';
-            const formattedSymbol = symbol.replace('USDT', '/USDT');
+            const formattedSymbol = symbol.replace('USDT', '_USDT');
             const message = `
 <b>Вход в сделку (${directionText}):</b> ${formattedSymbol}
 Цена входа: <b>${currentPrice}</b>
