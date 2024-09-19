@@ -1,14 +1,10 @@
 const WebSocket = require('ws');
-const TelegramBot = require('node-telegram-bot-api');
-
-// Инициализация бота с вашим токеном и включенным polling
-const bot = new TelegramBot('6898599983:AAGCokpNt5YxG6_DmcnCOju4UHKJYOE7UlE');
-const chatId = '5761109418';
-
+const messages = require('./messages');
 
 // Параметры стратегии
 const INITIAL_BALANCE = 1000; // Начальный баланс в USDT
-const TRADE_AMOUNT = 100; // Сумма сделки в USDT
+let currentBalance = INITIAL_BALANCE; // Текущий баланс
+const TRADE_AMOUNT_PERCENT = 0.1; // Торгуем 10% от доступного баланса
 
 const CHANGE_THRESHOLD = 10; // Порог изменения цены для входа в сделку (в процентах)
 const MIN_PROFIT_THRESHOLD = 5; // Минимальная прибыль для начала трейлинг-стопа (в процентах)
@@ -23,22 +19,19 @@ let pairs = {};
 let totalProfit = 0; // Общая прибыль в USDT
 let totalLoss = 0; // Общий убыток в USDT
 
-bot.sendMessage(chatId, '---------НОВОЕ НАЧАЛО--------').catch((error) => {
-    console.error('Ошибка при отправке сообщения в Telegram:', error.message);
-});
+messages.sendStartMessage();
 
 // Функция для запуска WebSocket соединения
 function startWebSocket() {
     const ws = new WebSocket('wss://stream.binance.com:9443/ws/!ticker@arr');
 
-    ws.on('open', function open() {
+    ws.on('open', () => {
         console.log('WebSocket подключен к Binance');
     });
 
-    ws.on('message', function incoming(data) {
+    ws.on('message', (data) => {
         try {
             const tickers = JSON.parse(data);
-
             tickers.forEach((ticker) => {
                 processTicker(ticker);
             });
@@ -47,17 +40,13 @@ function startWebSocket() {
         }
     });
 
-    ws.on('error', function error(error) {
+    ws.on('error', (error) => {
         console.error('WebSocket ошибка:', error.message);
     });
 
-    ws.on('close', function close() {
+    ws.on('close', () => {
         console.log('WebSocket соединение закрыто. Попытка переподключения...');
-
-        // Переподключение после задержки
-        setTimeout(() => {
-            startWebSocket();
-        }, 5000); // 5 секунд
+        setTimeout(startWebSocket, 5000); // Переподключение после задержки
     });
 }
 
@@ -89,7 +78,6 @@ function processTicker(ticker) {
 
     // Проверяем, прошло ли 24 часа с момента начала отслеживания
     if (now - pairData.initialTime >= MONITORING_PERIOD) {
-        // Сбрасываем данные и начинаем новый отсчет
         resetPairData(symbol, currentPrice, now);
         console.log(`Сброс данных для пары ${symbol} после 24 часов.`);
     }
@@ -98,24 +86,18 @@ function processTicker(ticker) {
     if (!pairData.inPosition) {
         const priceChangePercent = ((currentPrice - pairData.initialPrice) / pairData.initialPrice) * 100;
 
-        if (Math.abs(priceChangePercent) >= CHANGE_THRESHOLD) {
+        // Проверяем, можем ли мы войти в сделку
+        if (Math.abs(priceChangePercent) >= CHANGE_THRESHOLD && currentBalance >= INITIAL_BALANCE * TRADE_AMOUNT_PERCENT) {
             // Входим в сделку
+            const tradeAmount = currentBalance * TRADE_AMOUNT_PERCENT;
+            currentBalance -= tradeAmount;
             pairData.inPosition = true;
             pairData.entryPrice = currentPrice;
             pairData.maxPrice = currentPrice;
             pairData.direction = priceChangePercent > 0 ? 'up' : 'down';
 
             // Отправляем уведомление о входе в сделку
-            const directionText = pairData.direction === 'up' ? '📈 Покупка' : '📉 Продажа';
-            const formattedSymbol = symbol.replace('USDT', '_USDT');
-            const message = `
-<b>Вход в сделку (${directionText}):</b> ${formattedSymbol}
-Цена входа: <b>${currentPrice}</b>
-<a href="https://www.binance.com/ru/trade/${formattedSymbol}?type=spot">Открыть в Binance</a>
-`;
-            bot.sendMessage(chatId, message, { parse_mode: 'HTML' }).catch((error) => {
-                console.error('Ошибка при отправке сообщения в Telegram:', error.message);
-            });
+            messages.sendTradeEntryMessage(symbol, pairData.direction, currentPrice);
 
             console.log(`Вход в сделку по паре ${symbol} в направлении ${pairData.direction}`);
         }
@@ -143,22 +125,11 @@ function processTicker(ticker) {
             if (movementSinceEntry >= MIN_PROFIT_THRESHOLD && deviationPercent >= TRAILING_STOP_PERCENT) {
                 // Фиксируем прибыль
                 const profitPercent = ((pairData.maxPrice - pairData.entryPrice) / pairData.entryPrice) * 100 - TRAILING_STOP_PERCENT;
-                const profit = (TRADE_AMOUNT * profitPercent) / 100;
+                const profit = (currentBalance * TRADE_AMOUNT_PERCENT * profitPercent) / 100;
                 totalProfit += profit;
+                currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) + profit;
 
-                const formattedSymbol = symbol.replace('USDT', '/USDT');
-                const message = `
-✅ <b>Сделка закрыта с прибылью!</b>
-Пара: ${formattedSymbol}
-Прибыль: <b>${profit.toFixed(2)} USDT (${profitPercent.toFixed(2)}%)</b>
-Текущая цена: <b>${currentPrice}</b>
-Общая прибыль: <b>${totalProfit.toFixed(2)} USDT</b>
-Общий убыток: <b>${totalLoss.toFixed(2)} USDT</b>
-<a href="https://www.binance.com/ru/trade/${formattedSymbol}?layout=pro">Открыть в Binance</a>
-`;
-                bot.sendMessage(chatId, message, { parse_mode: 'HTML' }).catch((error) => {
-                    console.error('Ошибка при отправке сообщения в Telegram:', error.message);
-                });
+                messages.sendProfitMessage(symbol, profit, profitPercent, currentPrice, totalProfit, totalLoss);
 
                 // После фиксации прибыли продолжаем мониторинг только в противоположном направлении
                 pairData.inPosition = false;
@@ -168,22 +139,11 @@ function processTicker(ticker) {
                 console.log(`Фиксация прибыли по ${symbol}. Теперь отслеживаем движение вниз.`);
             } else if (movementSinceEntry <= -MAX_LOSS_THRESHOLD) {
                 // Фиксируем убыток
-                const loss = (TRADE_AMOUNT * MAX_LOSS_THRESHOLD) / 100;
+                const loss = (currentBalance * TRADE_AMOUNT_PERCENT * MAX_LOSS_THRESHOLD) / 100;
                 totalLoss += loss;
+                currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) - loss;
 
-                const formattedSymbol = symbol.replace('USDT', '/USDT');
-                const message = `
-❌ <b>Сделка закрыта с убытком.</b>
-Пара: ${formattedSymbol}
-Убыток: <b>${loss.toFixed(2)} USDT (${MAX_LOSS_THRESHOLD}%)</b>
-Текущая цена: <b>${currentPrice}</b>
-Общая прибыль: <b>${totalProfit.toFixed(2)} USDT</b>
-Общий убыток: <b>${totalLoss.toFixed(2)} USDT</b>
-<a href="https://www.binance.com/ru/trade/${formattedSymbol}?layout=pro">Открыть в Binance</a>
-`;
-                bot.sendMessage(chatId, message, { parse_mode: 'HTML' }).catch((error) => {
-                    console.error('Ошибка при отправке сообщения в Telegram:', error.message);
-                });
+                messages.sendLossMessage(symbol, loss, currentPrice, totalProfit, totalLoss);
 
                 // После фиксации убытка сбрасываем данные
                 resetPairData(symbol, currentPrice, now);
@@ -193,22 +153,11 @@ function processTicker(ticker) {
             if (movementSinceEntry <= -MIN_PROFIT_THRESHOLD && deviationPercent >= TRAILING_STOP_PERCENT) {
                 // Фиксируем прибыль
                 const profitPercent = ((pairData.entryPrice - pairData.maxPrice) / pairData.entryPrice) * 100 - TRAILING_STOP_PERCENT;
-                const profit = (TRADE_AMOUNT * profitPercent) / 100;
+                const profit = (currentBalance * TRADE_AMOUNT_PERCENT * profitPercent) / 100;
                 totalProfit += profit;
+                currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) + profit;
 
-                const formattedSymbol = symbol.replace('USDT', '/USDT');
-                const message = `
-✅ <b>Сделка закрыта с прибылью!</b>
-Пара: ${formattedSymbol}
-Прибыль: <b>${profit.toFixed(2)} USDT (${profitPercent.toFixed(2)}%)</b>
-Текущая цена: <b>${currentPrice}</b>
-Общая прибыль: <b>${totalProfit.toFixed(2)} USDT</b>
-Общий убыток: <b>${totalLoss.toFixed(2)} USDT</b>
-<a href="https://www.binance.com/ru/trade/${formattedSymbol}?layout=pro">Открыть в Binance</a>
-`;
-                bot.sendMessage(chatId, message, { parse_mode: 'HTML' }).catch((error) => {
-                    console.error('Ошибка при отправке сообщения в Telegram:', error.message);
-                });
+                messages.sendProfitMessage(symbol, profit, profitPercent, currentPrice, totalProfit, totalLoss);
 
                 // После фиксации прибыли продолжаем мониторинг только в противоположном направлении
                 pairData.inPosition = false;
@@ -218,28 +167,20 @@ function processTicker(ticker) {
                 console.log(`Фиксация прибыли по ${symbol}. Теперь отслеживаем движение вверх.`);
             } else if (movementSinceEntry >= MAX_LOSS_THRESHOLD) {
                 // Фиксируем убыток
-                const loss = (TRADE_AMOUNT * MAX_LOSS_THRESHOLD) / 100;
+                const loss = (currentBalance * TRADE_AMOUNT_PERCENT * MAX_LOSS_THRESHOLD) / 100;
                 totalLoss += loss;
+                currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) - loss;
 
-                const formattedSymbol = symbol.replace('USDT', '/USDT');
-                const message = `
-❌ <b>Сделка закрыта с убытком.</b>
-Пара: ${formattedSymbol}
-Убыток: <b>${loss.toFixed(2)} USDT (${MAX_LOSS_THRESHOLD}%)</b>
-Текущая цена: <b>${currentPrice}</b>
-Общая прибыль: <b>${totalProfit.toFixed(2)} USDT</b>
-Общий убыток: <b>${totalLoss.toFixed(2)} USDT</b>
-<a href="https://www.binance.com/ru/trade/${formattedSymbol}?layout=pro">Открыть в Binance</a>
-`;
-                bot.sendMessage(chatId, message, { parse_mode: 'HTML' }).catch((error) => {
-                    console.error('Ошибка при отправке сообщения в Telegram:', error.message);
-                });
+                messages.sendLossMessage(symbol, loss, currentPrice, totalProfit, totalLoss);
 
                 // После фиксации убытка сбрасываем данные
                 resetPairData(symbol, currentPrice, now);
                 console.log(`Фиксация убытка по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
             }
         }
+
+        // Отправляем обновление о состоянии сделки
+        messages.sendUpdateMessage(symbol, movementSinceEntry, currentPrice, pairData.direction);
     }
 }
 
