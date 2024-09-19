@@ -58,19 +58,9 @@ module.exports = {
         });
     },
 
-    sendUpdateMessage: (symbol, profitPercent, currentPrice, direction) => {
-        const formattedSymbol = symbol.replace('USDT', '/USDT');
-        const directionText = direction === 'up' ? '📈' : '📉';
-        const message = `
-ℹ️ <b>Обновление по сделке:</b> ${formattedSymbol}
-Направление: ${directionText}
-Текущая прибыль/убыток: <b>${profitPercent.toFixed(2)}%</b>
-Текущая цена: <b>${currentPrice}</b>
-<a href="https://www.binance.com/ru/trade/${formattedSymbol}?layout=pro">Открыть в Binance</a>
-`;
+    sendUpdateMessageList: (message) => {
         bot.sendMessage(chatId, message, { parse_mode: 'HTML' }).catch((error) => {
             console.error('Ошибка при отправке сообщения в Telegram:', error.message);
         });
     }
 };
-

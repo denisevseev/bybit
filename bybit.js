@@ -100,6 +100,9 @@ function processTicker(ticker) {
             messages.sendTradeEntryMessage(symbol, pairData.direction, currentPrice);
 
             console.log(`Вход в сделку по паре ${symbol} в направлении ${pairData.direction}`);
+
+            // Отправляем список открытых сделок
+            sendOpenTradesUpdate();
         }
     } else {
         // Мы в позиции, следим за ценой
@@ -137,6 +140,9 @@ function processTicker(ticker) {
                 pairData.initialTime = now;
                 pairData.direction = 'down'; // Теперь отслеживаем только продажи
                 console.log(`Фиксация прибыли по ${symbol}. Теперь отслеживаем движение вниз.`);
+
+                // Отправляем список открытых сделок
+                sendOpenTradesUpdate();
             } else if (movementSinceEntry <= -MAX_LOSS_THRESHOLD) {
                 // Фиксируем убыток
                 const loss = (currentBalance * TRADE_AMOUNT_PERCENT * MAX_LOSS_THRESHOLD) / 100;
@@ -148,6 +154,9 @@ function processTicker(ticker) {
                 // После фиксации убытка сбрасываем данные
                 resetPairData(symbol, currentPrice, now);
                 console.log(`Фиксация убытка по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
+
+                // Отправляем список открытых сделок
+                sendOpenTradesUpdate();
             }
         } else if (pairData.direction === 'down') {
             if (movementSinceEntry <= -MIN_PROFIT_THRESHOLD && deviationPercent >= TRAILING_STOP_PERCENT) {
@@ -165,6 +174,9 @@ function processTicker(ticker) {
                 pairData.initialTime = now;
                 pairData.direction = 'up'; // Теперь отслеживаем только покупки
                 console.log(`Фиксация прибыли по ${symbol}. Теперь отслеживаем движение вверх.`);
+
+                // Отправляем список открытых сделок
+                sendOpenTradesUpdate();
             } else if (movementSinceEntry >= MAX_LOSS_THRESHOLD) {
                 // Фиксируем убыток
                 const loss = (currentBalance * TRADE_AMOUNT_PERCENT * MAX_LOSS_THRESHOLD) / 100;
@@ -176,11 +188,11 @@ function processTicker(ticker) {
                 // После фиксации убытка сбрасываем данные
                 resetPairData(symbol, currentPrice, now);
                 console.log(`Фиксация убытка по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
+
+                // Отправляем список открытых сделок
+                sendOpenTradesUpdate();
             }
         }
-
-        // Отправляем обновление о состоянии сделки
-        messages.sendUpdateMessage(symbol, movementSinceEntry, currentPrice, pairData.direction);
     }
 }
 
@@ -196,4 +208,26 @@ function resetPairData(symbol, currentPrice, now) {
     };
 }
 
+// Функция для отправки списка открытых сделок
+function sendOpenTradesUpdate() {
+    let openTrades = Object.keys(pairs)
+        .filter(symbol => pairs[symbol].inPosition)
+        .map(symbol => {
+            const pairData = pairs[symbol];
+            const profitPercent = ((pairData.direction === 'up' ? pairData.maxPrice - pairData.entryPrice : pairData.entryPrice - pairData.maxPrice) / pairData.entryPrice) * 100;
+            const directionText = pairData.direction === 'up' ? 'Лонг' : 'Шорт';
+            return `${symbol.replace('USDT', '/USDT')}: Цена входа: ${pairData.entryPrice.toFixed(2)}, ${directionText}, Текущий % изменения: ${profitPercent.toFixed(2)}%`;
+        });
+
+    if (openTrades.length > 0) {
+        const message = `
+📊 <b>Открытые сделки:</b>\n${openTrades.join('\n')}
+`;
+        messages.sendUpdateMessageList(message);
+    } else {
+        messages.sendUpdateMessageList('ℹ️ <b>Нет открытых сделок на данный момент.</b>');
+    }
+}
+
 startWebSocket();
+
