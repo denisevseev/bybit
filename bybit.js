@@ -7,10 +7,12 @@ let currentBalance = INITIAL_BALANCE; // Текущий баланс
 const TRADE_AMOUNT_PERCENT = 0.1; // Торгуем 10% от доступного баланса
 
 const CHANGE_THRESHOLD = 10; // Порог изменения цены для входа в сделку (в процентах)
-const MIN_PROFIT_THRESHOLD = 5; // Минимальная прибыль для начала трейлинг-стопа (в процентах)
-const TRAILING_STOP_PERCENT = 3; // Отклонение трейлинг-стопа от максимальной цены (в процентах)
+const PROFIT_THRESHOLD = 5; // Порог прибыли для фиксации (в процентах)
 const MAX_LOSS_THRESHOLD = 20; // Порог убытка для выхода из сделки (в процентах)
 const MONITORING_PERIOD = 24 * 60 * 60 * 1000; // 24 часа в миллисекундах
+
+// Минимальный объем торгов в USDT за 24 часа для входа в сделку
+const MIN_VOLUME_USDT = 1000000;
 
 // Объект для хранения состояния каждой валютной пары
 let pairs = {};
@@ -54,9 +56,10 @@ function startWebSocket() {
 function processTicker(ticker) {
     const symbol = ticker.s;
     const currentPrice = parseFloat(ticker.c);
+    const volume24h = parseFloat(ticker.q); // Объем торгов за 24 часа в USDT
 
-    // Фильтруем только пары с USDT
-    if (!symbol.endsWith('USDT')) {
+    // Фильтруем только пары с USDT и проверяем объем торгов
+    if (!symbol.endsWith('USDT') || volume24h < MIN_VOLUME_USDT) {
         return;
     }
 
@@ -69,7 +72,6 @@ function processTicker(ticker) {
             initialTime: now,
             inPosition: false,
             entryPrice: null,
-            maxPrice: null,
             direction: null, // 'up' или 'down'
         };
     }
@@ -93,7 +95,6 @@ function processTicker(ticker) {
             currentBalance -= tradeAmount;
             pairData.inPosition = true;
             pairData.entryPrice = currentPrice;
-            pairData.maxPrice = currentPrice;
             pairData.direction = priceChangePercent > 0 ? 'up' : 'down';
 
             // Отправляем уведомление о входе в сделку
@@ -107,91 +108,37 @@ function processTicker(ticker) {
     } else {
         // Мы в позиции, следим за ценой
         const movementSinceEntry = ((currentPrice - pairData.entryPrice) / pairData.entryPrice) * 100;
-
-        // Обновляем максимальную цену в зависимости от направления
-        if (pairData.direction === 'up' && currentPrice > pairData.maxPrice) {
-            pairData.maxPrice = currentPrice;
-        } else if (pairData.direction === 'down' && currentPrice < pairData.maxPrice) {
-            pairData.maxPrice = currentPrice;
-        }
-
-        // Рассчитываем отклонение от максимальной цены
-        let deviationPercent = 0;
-        if (pairData.direction === 'up') {
-            deviationPercent = ((pairData.maxPrice - currentPrice) / pairData.maxPrice) * 100;
-        } else if (pairData.direction === 'down') {
-            deviationPercent = ((currentPrice - pairData.maxPrice) / pairData.maxPrice) * 100;
-        }
+        const profitPercent = pairData.direction === 'up' ? movementSinceEntry : -movementSinceEntry;
 
         // Проверяем на фиксацию прибыли или убытка
-        if (pairData.direction === 'up') {
-            if (movementSinceEntry >= MIN_PROFIT_THRESHOLD && deviationPercent >= TRAILING_STOP_PERCENT) {
-                // Фиксируем прибыль
-                const profitPercent = ((pairData.maxPrice - pairData.entryPrice) / pairData.entryPrice) * 100 - TRAILING_STOP_PERCENT;
-                const profit = (currentBalance * TRADE_AMOUNT_PERCENT * profitPercent) / 100;
-                totalProfit += profit;
-                currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) + profit;
+        if (profitPercent >= PROFIT_THRESHOLD) {
+            // Фиксируем прибыль
+            const profit = (currentBalance * TRADE_AMOUNT_PERCENT * PROFIT_THRESHOLD) / 100;
+            totalProfit += profit;
+            currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) + profit;
 
-                messages.sendProfitMessage(symbol, profit, profitPercent, currentPrice, totalProfit, totalLoss);
+            messages.sendProfitMessage(symbol, profit, PROFIT_THRESHOLD, currentPrice, totalProfit, totalLoss);
 
-                // После фиксации прибыли продолжаем мониторинг только в противоположном направлении
-                pairData.inPosition = false;
-                pairData.initialPrice = currentPrice;
-                pairData.initialTime = now;
-                pairData.direction = 'down'; // Теперь отслеживаем только продажи
-                console.log(`Фиксация прибыли по ${symbol}. Теперь отслеживаем движение вниз.`);
+            // Сбрасываем данные для этой пары
+            resetPairData(symbol, currentPrice, now);
+            console.log(`Фиксация прибыли по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
 
-                // Отправляем список открытых сделок
-                sendOpenTradesUpdate();
-            } else if (movementSinceEntry <= -MAX_LOSS_THRESHOLD) {
-                // Фиксируем убыток
-                const loss = (currentBalance * TRADE_AMOUNT_PERCENT * MAX_LOSS_THRESHOLD) / 100;
-                totalLoss += loss;
-                currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) - loss;
+            // Отправляем список открытых сделок
+            sendOpenTradesUpdate();
+        } else if (profitPercent <= -MAX_LOSS_THRESHOLD) {
+            // Фиксируем убыток
+            const loss = (currentBalance * TRADE_AMOUNT_PERCENT * MAX_LOSS_THRESHOLD) / 100;
+            totalLoss += loss;
+            currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) - loss;
 
-                messages.sendLossMessage(symbol, loss, currentPrice, totalProfit, totalLoss);
+            messages.sendLossMessage(symbol, loss, currentPrice, totalProfit, totalLoss);
 
-                // После фиксации убытка сбрасываем данные
-                resetPairData(symbol, currentPrice, now);
-                console.log(`Фиксация убытка по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
+            // Сбрасываем данные для этой пары
+            resetPairData(symbol, currentPrice, now);
+            console.log(`Фиксация убытка по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
 
-                // Отправляем список открытых сделок
-                sendOpenTradesUpdate();
-            }
-        } else if (pairData.direction === 'down') {
-            if (movementSinceEntry <= -MIN_PROFIT_THRESHOLD && deviationPercent >= TRAILING_STOP_PERCENT) {
-                // Фиксируем прибыль
-                const profitPercent = ((pairData.entryPrice - pairData.maxPrice) / pairData.entryPrice) * 100 - TRAILING_STOP_PERCENT;
-                const profit = (currentBalance * TRADE_AMOUNT_PERCENT * profitPercent) / 100;
-                totalProfit += profit;
-                currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) + profit;
-
-                messages.sendProfitMessage(symbol, profit, profitPercent, currentPrice, totalProfit, totalLoss);
-
-                // После фиксации прибыли продолжаем мониторинг только в противоположном направлении
-                pairData.inPosition = false;
-                pairData.initialPrice = currentPrice;
-                pairData.initialTime = now;
-                pairData.direction = 'up'; // Теперь отслеживаем только покупки
-                console.log(`Фиксация прибыли по ${symbol}. Теперь отслеживаем движение вверх.`);
-
-                // Отправляем список открытых сделок
-                sendOpenTradesUpdate();
-            } else if (movementSinceEntry >= MAX_LOSS_THRESHOLD) {
-                // Фиксируем убыток
-                const loss = (currentBalance * TRADE_AMOUNT_PERCENT * MAX_LOSS_THRESHOLD) / 100;
-                totalLoss += loss;
-                currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) - loss;
-
-                messages.sendLossMessage(symbol, loss, currentPrice, totalProfit, totalLoss);
-
-                // После фиксации убытка сбрасываем данные
-                resetPairData(symbol, currentPrice, now);
-                console.log(`Фиксация убытка по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
-
-                // Отправляем список открытых сделок
-                sendOpenTradesUpdate();
-            }
+            // Отправляем список открытых сделок
+            sendOpenTradesUpdate();
         }
     }
 }
@@ -203,7 +150,6 @@ function resetPairData(symbol, currentPrice, now) {
         initialTime: now,
         inPosition: false,
         entryPrice: null,
-        maxPrice: null,
         direction: null,
     };
 }
@@ -214,9 +160,10 @@ function sendOpenTradesUpdate() {
         .filter(symbol => pairs[symbol].inPosition)
         .map(symbol => {
             const pairData = pairs[symbol];
-            const profitPercent = ((pairData.direction === 'up' ? pairData.maxPrice - pairData.entryPrice : pairData.entryPrice - pairData.maxPrice) / pairData.entryPrice) * 100;
+            const movementSinceEntry = ((pairData.entryPrice - pairData.initialPrice) / pairData.initialPrice) * 100;
+            const profitPercent = pairData.direction === 'up' ? movementSinceEntry : -movementSinceEntry;
             const directionText = pairData.direction === 'up' ? 'Лонг' : 'Шорт';
-            return `${symbol.replace('USDT', '/USDT')}: Цена входа: ${pairData.entryPrice.toFixed(2)}, ${directionText}, Текущий % изменения: ${profitPercent.toFixed(2)}%`;
+            return `${symbol.replace('USDT', '/USDT')}: Цена входа: ${pairData.entryPrice.toFixed(2)}, ${directionText}, Текущий % изменения: ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(2)}%`;
         });
 
     if (openTrades.length > 0) {
@@ -230,4 +177,3 @@ function sendOpenTradesUpdate() {
 }
 
 startWebSocket();
-
