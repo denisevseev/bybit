@@ -1,14 +1,15 @@
 const WebSocket = require('ws');
-const messages = require('./messages');
+const fs = require('fs');
 
 // Параметры стратегии
 const INITIAL_BALANCE = 1000; // Начальный баланс в USDT
 let currentBalance = INITIAL_BALANCE; // Текущий баланс
 const TRADE_AMOUNT_PERCENT = 0.1; // Торгуем 10% от доступного баланса
 
-const CHANGE_THRESHOLD = 10; // Порог изменения цены для входа в сделку (в процентах)
-const PROFIT_THRESHOLD = 5; // Порог прибыли для фиксации (в процентах)
+const CHANGE_THRESHOLD = 1; // Порог изменения цены для входа в сделку (в процентах)
+const PROFIT_THRESHOLD = 2; // Порог прибыли для фиксации (в процентах)
 const MAX_LOSS_THRESHOLD = 20; // Порог убытка для выхода из сделки (в процентах)
+const MIN_PROFIT_AMOUNT = 4; // Минимальная прибыль для фиксации сделки (в USDT)
 const MONITORING_PERIOD = 24 * 60 * 60 * 1000; // 24 часа в миллисекундах
 
 // Минимальный объем торгов в USDT за 24 часа для входа в сделку
@@ -21,7 +22,11 @@ let pairs = {};
 let totalProfit = 0; // Общая прибыль в USDT
 let totalLoss = 0; // Общий убыток в USDT
 
-messages.sendStartMessage();
+// Функция для записи логов в файл
+function logToFile(message) {
+    const timestamp = new Date().toLocaleString();
+    fs.appendFileSync('trades_log.txt', `${timestamp} - ${message}\n`);
+}
 
 // Функция для запуска WebSocket соединения
 function startWebSocket() {
@@ -81,7 +86,7 @@ function processTicker(ticker) {
     // Проверяем, прошло ли 24 часа с момента начала отслеживания
     if (now - pairData.initialTime >= MONITORING_PERIOD) {
         resetPairData(symbol, currentPrice, now);
-        console.log(`Сброс данных для пары ${symbol} после 24 часов.`);
+        logToFile(`Сброс данных для пары ${symbol} после 24 часов.`);
     }
 
     // Если мы не в позиции
@@ -97,48 +102,38 @@ function processTicker(ticker) {
             pairData.entryPrice = currentPrice;
             pairData.direction = priceChangePercent > 0 ? 'up' : 'down';
 
-            // Отправляем уведомление о входе в сделку
-            messages.sendTradeEntryMessage(symbol, pairData.direction, currentPrice);
-
-            console.log(`Вход в сделку по паре ${symbol} в направлении ${pairData.direction}`);
-
-            // Отправляем список открытых сделок
-            sendOpenTradesUpdate();
+            // Логируем вход в сделку
+            logToFile(`Вход в сделку по паре ${symbol} в направлении ${pairData.direction}. Цена открытия: ${currentPrice.toFixed(6)}`);
         }
     } else {
         // Мы в позиции, следим за ценой
         const movementSinceEntry = ((currentPrice - pairData.entryPrice) / pairData.entryPrice) * 100;
         const profitPercent = pairData.direction === 'up' ? movementSinceEntry : -movementSinceEntry;
 
-        // Проверяем на фиксацию прибыли или убытка
-        if (profitPercent >= PROFIT_THRESHOLD) {
-            // Фиксируем прибыль
-            const profit = (currentBalance * TRADE_AMOUNT_PERCENT * PROFIT_THRESHOLD) / 100;
-            totalProfit += profit;
-            currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) + profit;
+        // Рассчитываем потенциальную прибыль в долларах
+        const tradeAmount = currentBalance * TRADE_AMOUNT_PERCENT;
+        const potentialProfit = (tradeAmount * profitPercent) / 100;
 
-            messages.sendProfitMessage(symbol, profit, PROFIT_THRESHOLD, currentPrice, totalProfit, totalLoss);
+        // Фиксация прибыли только если она больше или равна MIN_PROFIT_AMOUNT
+        if (profitPercent >= PROFIT_THRESHOLD && potentialProfit >= MIN_PROFIT_AMOUNT) {
+            totalProfit += potentialProfit;
+            currentBalance += tradeAmount + potentialProfit;
 
-            // Сбрасываем данные для этой пары
-            resetPairData(symbol, currentPrice, now);
-            console.log(`Фиксация прибыли по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
+            // Логируем прибыль с указанием цен открытия и закрытия, а также процента изменения
+            logToFile(`Прибыль по ${symbol}: ${potentialProfit.toFixed(6)} USDT. Цена открытия: ${pairData.entryPrice.toFixed(6)}, Цена закрытия: ${currentPrice.toFixed(6)}, Процент изменения: ${profitPercent.toFixed(2)}%`);
 
-            // Отправляем список открытых сделок
-            sendOpenTradesUpdate();
-        } else if (profitPercent <= -MAX_LOSS_THRESHOLD) {
-            // Фиксируем убыток
-            const loss = (currentBalance * TRADE_AMOUNT_PERCENT * MAX_LOSS_THRESHOLD) / 100;
+            resetPairData(symbol, currentPrice, now); // Сбрасываем данные о сделке
+        }
+
+        // Фиксация убытка
+        else if (profitPercent <= -MAX_LOSS_THRESHOLD) {
+            const loss = (tradeAmount * MAX_LOSS_THRESHOLD) / 100;
             totalLoss += loss;
-            currentBalance += (currentBalance * TRADE_AMOUNT_PERCENT) - loss;
+            currentBalance += tradeAmount - loss;
 
-            messages.sendLossMessage(symbol, loss, currentPrice, totalProfit, totalLoss);
+            logToFile(`Убыток по ${symbol}: ${loss.toFixed(6)} USDT. Цена открытия: ${pairData.entryPrice.toFixed(6)}, Цена закрытия: ${currentPrice.toFixed(6)}, Процент изменения: ${profitPercent.toFixed(2)}%`);
 
-            // Сбрасываем данные для этой пары
             resetPairData(symbol, currentPrice, now);
-            console.log(`Фиксация убытка по ${symbol}. Сбрасываем данные и начинаем новый отсчет.`);
-
-            // Отправляем список открытых сделок
-            sendOpenTradesUpdate();
         }
     }
 }
@@ -154,26 +149,5 @@ function resetPairData(symbol, currentPrice, now) {
     };
 }
 
-// Функция для отправки списка открытых сделок
-function sendOpenTradesUpdate() {
-    let openTrades = Object.keys(pairs)
-        .filter(symbol => pairs[symbol].inPosition)
-        .map(symbol => {
-            const pairData = pairs[symbol];
-            const movementSinceEntry = ((pairData.entryPrice - pairData.initialPrice) / pairData.initialPrice) * 100;
-            const profitPercent = pairData.direction === 'up' ? movementSinceEntry : -movementSinceEntry;
-            const directionText = pairData.direction === 'up' ? 'Лонг' : 'Шорт';
-            return `${symbol.replace('USDT', '/USDT')}: Цена входа: ${pairData.entryPrice.toFixed(2)}, ${directionText}, Текущий % изменения: ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(2)}%`;
-        });
-
-    if (openTrades.length > 0) {
-        const message = `
-📊 <b>Открытые сделки:</b>\n${openTrades.join('\n')}
-`;
-        messages.sendUpdateMessageList(message);
-    } else {
-        messages.sendUpdateMessageList('ℹ️ <b>Нет открытых сделок на данный момент.</b>');
-    }
-}
-
+// Запускаем WebSocket для мониторинга
 startWebSocket();
