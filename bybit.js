@@ -226,7 +226,7 @@ async function processTicker(ticker) {
             highestPrice: null,
             disableMonitoring: false, // Отключение таймера сброса
         };
-        logToFile(`Новая пара добавлена для отслеживания: ${symbol}, начальная цена: ${currentPrice}`);
+        // logToFile(`Новая пара добавлена для отслеживания: ${symbol}, начальная цена: ${currentPrice}`);
         return;
     }
 
