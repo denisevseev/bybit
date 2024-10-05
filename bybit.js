@@ -315,7 +315,6 @@ function startWebSocket() {
 
     ws.on('open', () => {
         console.log('WebSocket подключен к Binance');
-        logToFile('WebSocket подключен к Binance');
     });
 
     ws.on('message', (data) => {
