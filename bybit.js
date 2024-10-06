@@ -49,17 +49,23 @@ async function getSymbolInfo(symbol) {
 async function calculateMinQuantity(symbol, currentPrice) {
     try {
         const symbolInfo = await getSymbolInfo(symbol);
+
         const lotSizeFilter = symbolInfo.filters.find(f => f.filterType === 'LOT_SIZE');
-        const minQty = parseFloat(lotSizeFilter.minQty);
         const stepSize = parseFloat(lotSizeFilter.stepSize);
-        const minNotionalFilter = symbolInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL');
-        const minNotional = minNotionalFilter ? parseFloat(minNotionalFilter.minNotional) : null;
+        const minQty = parseFloat(lotSizeFilter.minQty);
+
         let tradeQuantity = minQty;
+
+        // Округляем количество до ближайшего кратного шагу
         tradeQuantity = Math.floor(tradeQuantity / stepSize) * stepSize;
 
+        const minNotionalFilter = symbolInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL');
+        const minNotional = minNotionalFilter ? parseFloat(minNotionalFilter.minNotional) : null;
+
+        // Проверка минимального объема сделки (NOTIONAL)
         if (minNotional && tradeQuantity * currentPrice < minNotional) {
             tradeQuantity = minNotional / currentPrice;
-            tradeQuantity = Math.floor(tradeQuantity / stepSize) * stepSize;
+            tradeQuantity = Math.floor(tradeQuantity / stepSize) * stepSize;  // Округляем по шагу
         }
 
         logToFile(`Рассчитанное минимальное количество для ${symbol}: ${tradeQuantity}`);
@@ -69,6 +75,9 @@ async function calculateMinQuantity(symbol, currentPrice) {
         throw error;
     }
 }
+
+
+
 
 async function getBalance() {
     const endpoint = '/api/v3/account';
@@ -139,7 +148,7 @@ async function processTicker(ticker) {
             highestPrice: null,
             disableMonitoring: false,
         };
-        logToFile(`Новая пара добавлена для отслеживания: ${symbol}, начальная цена: ${currentPrice}`);
+        console.log(`Новая пара добавлена для отслеживания: ${symbol}, начальная цена: ${currentPrice}`);
         return;
     }
 
@@ -153,7 +162,7 @@ async function processTicker(ticker) {
     if (!pairData.inPosition) {
         const priceChangePercent = ((currentPrice - pairData.initialPrice) / pairData.initialPrice) * 100;
 
-        if (2>1) {
+        if (Math.abs(priceChangePercent) >= CHANGE_THRESHOLD) {
             let res = await createOrderWithMinCheck(symbol, priceChangePercent > 0 ? 'BUY' : 'SELL', currentPrice);
             pairData.inPosition = true;
             pairData.entryPrice = currentPrice;
