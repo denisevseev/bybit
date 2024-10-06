@@ -153,15 +153,18 @@ async function processTicker(ticker) {
     if (!pairData.inPosition) {
         const priceChangePercent = ((currentPrice - pairData.initialPrice) / pairData.initialPrice) * 100;
 
-        if (Math.abs(priceChangePercent) >= CHANGE_THRESHOLD) {
-            await createOrderWithMinCheck(symbol, priceChangePercent > 0 ? 'BUY' : 'SELL', currentPrice);
+        if (2>1) {
+            let res = await createOrderWithMinCheck(symbol, priceChangePercent > 0 ? 'BUY' : 'SELL', currentPrice);
             pairData.inPosition = true;
             pairData.entryPrice = currentPrice;
             pairData.direction = priceChangePercent > 0 ? 'up' : 'down';
             pairData.highestPrice = currentPrice;
             pairData.disableMonitoring = true;
 
-            logToFile(`Вход в сделку по паре ${symbol} в направлении ${pairData.direction}. Цена открытия: ${currentPrice.toFixed(6)}`);
+            if (res){
+                logToFile(`Вход в сделку по паре ${symbol} в направлении ${pairData.direction}. Цена открытия: ${currentPrice.toFixed(6)}`);
+            }
+
         }
     } else {
         const movementSinceEntry = ((currentPrice - pairData.entryPrice) / pairData.entryPrice) * 100;
@@ -216,8 +219,10 @@ async function createOrderWithMinCheck(symbol, side, currentPrice) {
 
         await createOrder(symbol, side, tradeQuantity);
         logToFile(`Успешно создан ордер с минимальным количеством: ${side} ${symbol}, количество: ${tradeQuantity}`);
+        return true
     } catch (error) {
         logToFile(`Ошибка при создании ордера для ${symbol}: ${error.message}`);
+        return  false
     }
 }
 
