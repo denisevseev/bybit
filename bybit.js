@@ -9,8 +9,8 @@ const SECRET_KEY = 'EZBzLuzGFuNaK3xiRt7bcWmkqKdqJdfhwEtP5p9JThemrRj10PD0GvUvNXAx
 const PERCENT_CHANGE = 0.05;
 const MIN_CONTINUE_CHANGE = 0.03;
 const MAX_CORRECTION = 0.01;
-// const STABILITY_DURATION = 60 * 1000; // 1 минута в миллисекундах
-const STABILITY_DURATION = 1; // удержание цены
+const STABILITY_DURATION = 86400000
+
 
 let accountBalance = 0;
 let lastPrices = {};
