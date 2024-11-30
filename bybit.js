@@ -8,19 +8,18 @@ const BASE_URL = 'https://fapi.binance.com';
 const WS_BASE_URL = 'wss://fstream.binance.com/stream';
 const API_KEY = 'R7nkPfaYEmtCYEgE4kCQQy4WHdkOUOTgyDKHIcvyBP3qVEWCkDIhUuOHYUjhQUG5';
 const SECRET_KEY = 'EZBzLuzGFuNaK3xiRt7bcWmkqKdqJdfhwEtP5p9JThemrRj10PD0GvUvNXAxXMa7';
-const PERCENT_CHANGE = 0.06; // 7% изменение цены для обнаружения
-const STABILITY_DURATION = 5 * 1000; // 30 секунд для стабильности
-const MAX_CORRECTION = 0.02; // 2% максимальная коррекция цены во время стабильности
+const PERCENT_CHANGE = 0.06; // 6% изменение цены для обнаружения
+const WAIT_TIME = 10 * 1000; // 10 секунд ожидания после изменения цены
+const MAX_CORRECTION = 0.02; // 2% максимальная коррекция цены во время ожидания
 const PROFIT_TARGET = 0.03; // 3% цель по прибыли
 const LOSS_THRESHOLD = 0.10; // 10% изменение против позиции для фиксации убытка
 const CORRECTION_AFTER_PROFIT = 0.01; // 1% коррекция после достижения прибыли
 const LOSS_THRESHOLD_FOR_RECOVERY = 0.05; // 5% порог убытка для отслеживания возврата к точке входа
 
-
 let accountBalance = 0;
 let priceHistory = {}; // Хранит историю цен для каждого символа
 let openPositions = {}; // Хранит открытые позиции для каждого символа
-let potentialEntries = {}; // Хранит символы, ожидающие стабильности после изменения
+let potentialEntries = {}; // Хранит символы, ожидающие после изменения цены
 let priceUpdates = {}; // Хранит последние обновления цен из WebSocket
 
 const logFile = path.join(__dirname, 'trade.log');
@@ -157,7 +156,7 @@ async function openPosition(symbol, side) {
             quantity,
             openTime: Date.now(),
             profitTargetReached: false,
-            lossThresholdReached: false, // Новое свойство
+            lossThresholdReached: false,
             peakPrice: price
         };
         accountBalance -= orderValue;
@@ -204,51 +203,54 @@ function handlePriceUpdate(data) {
 
     if (!symbol || !currentPrice) return;
 
-    if (!priceHistory[symbol]) {
-        priceHistory[symbol] = [];
-    }
-
-    // Обновляем историю цен (используем для коррекции)
-    priceHistory[symbol].push({ time: currentTime, price: currentPrice });
-    // Удаляем записи старше STABILITY_DURATION
-    priceHistory[symbol] = priceHistory[symbol].filter(entry => currentTime - entry.time <= STABILITY_DURATION);
-
     // Обновляем последнюю цену
     priceUpdates[symbol] = currentPrice;
 
     // Обработка потенциальных входов
     if (potentialEntries[symbol]) {
         const entry = potentialEntries[symbol];
-        const percentChangeDuringStability = (currentPrice - entry.startPrice) / entry.startPrice;
 
-        // Проверяем коррекцию
-        const correction = Math.abs(percentChangeDuringStability - entry.percentChange);
-        if (correction <= MAX_CORRECTION) {
-            // Проверяем, прошло ли время стабильности
-            if (currentTime - entry.startTime >= STABILITY_DURATION) {
-                const direction = entry.percentChange > 0 ? 'BUY' : 'SELL';
-                log(`Подтверждено стабильное изменение цены для ${symbol}: ${(entry.percentChange * 100).toFixed(2)}% за ${(STABILITY_DURATION / 1000)} секунд. Открываем позицию ${direction}.`);
-                openPosition(symbol, direction);
-                delete potentialEntries[symbol];
-            }
-        } else {
-            // Коррекция превышена, сбрасываем
-            log(`Коррекция цены превышена для ${symbol}. Сбрасываем таймер стабильности.`);
+        // Вычисляем изменение цены против нас с момента начала ожидания
+        const percentChangeDuringWait = (currentPrice - entry.startPrice) / entry.startPrice;
+        const movementAgainstUs = (entry.direction === 'BUY' && percentChangeDuringWait < 0) || (entry.direction === 'SELL' && percentChangeDuringWait > 0);
+
+        if (movementAgainstUs && Math.abs(percentChangeDuringWait) >= MAX_CORRECTION) {
+            // Цена пошла против нас более чем на MAX_CORRECTION, сбрасываем данные
+            log(`Цена по ${symbol} пошла против нас более чем на ${(MAX_CORRECTION * 100).toFixed(2)}% во время ожидания. Сбрасываем данные и начинаем заново.`);
+            delete potentialEntries[symbol];
+            return;
+        }
+
+        // Проверяем, прошло ли 10 секунд
+        if (currentTime - entry.startTime >= WAIT_TIME) {
+            // Открываем позицию
+            log(`Ожидание завершено для ${symbol}. Открываем позицию ${entry.direction}.`);
+            openPosition(symbol, entry.direction);
             delete potentialEntries[symbol];
         }
     } else {
         // Проверяем изменение цены на PERCENT_CHANGE или более
-        const oldPriceEntry = priceHistory[symbol][0];
-        if (oldPriceEntry) {
-            const percentChange = (currentPrice - oldPriceEntry.price) / oldPriceEntry.price;
-            if (Math.abs(percentChange) >= PERCENT_CHANGE) {
-                // Начинаем отсчет стабильности
-                potentialEntries[symbol] = {
-                    startTime: currentTime,
-                    startPrice: currentPrice,
-                    percentChange
-                };
-                log(`Обнаружено изменение цены для ${symbol}: ${(percentChange * 100).toFixed(2)}%. Запускаем таймер стабильности.`);
+        if (!priceHistory[symbol]) {
+            priceHistory[symbol] = { time: currentTime, price: currentPrice };
+            return;
+        }
+
+        const oldPriceEntry = priceHistory[symbol];
+        const percentChange = (currentPrice - oldPriceEntry.price) / oldPriceEntry.price;
+
+        if (Math.abs(percentChange) >= PERCENT_CHANGE) {
+            const direction = percentChange > 0 ? 'BUY' : 'SELL';
+            // Начинаем отсчет 10 секунд
+            potentialEntries[symbol] = {
+                startTime: currentTime,
+                startPrice: currentPrice,
+                direction
+            };
+            log(`Обнаружено изменение цены для ${symbol}: ${(percentChange * 100).toFixed(2)}%. Ждем 10 секунд для возможного входа в позицию ${direction}.`);
+        } else {
+            // Обновляем последнюю известную цену, если прошло значительное время
+            if (currentTime - oldPriceEntry.time >= WAIT_TIME) {
+                priceHistory[symbol] = { time: currentTime, price: currentPrice };
             }
         }
     }
@@ -282,7 +284,7 @@ function handlePriceUpdate(data) {
             if (isBackToEntry) {
                 log(`Цена вернулась к точке входа после убытка для ${symbol}. Закрываем позицию.`);
                 closePosition(symbol);
-                return; // Прекращаем дальнейшую обработку для этого символа
+                return;
             }
         }
 
@@ -312,7 +314,7 @@ function handlePriceUpdate(data) {
             if (profitCorrection >= CORRECTION_AFTER_PROFIT) {
                 log(`Коррекция цены после достижения цели прибыли для ${symbol}. Закрываем позицию.`);
                 closePosition(symbol);
-                return; // Прекращаем дальнейшую обработку для этого символа
+                return;
             }
         }
     }
