@@ -1,24 +1,37 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
 
 const BASE_URL = 'https://fapi.binance.com';
 const WS_BASE_URL = 'wss://fstream.binance.com/stream';
 const API_KEY = 'R7nkPfaYEmtCYEgE4kCQQy4WHdkOUOTgyDKHIcvyBP3qVEWCkDIhUuOHYUjhQUG5';
 const SECRET_KEY = 'EZBzLuzGFuNaK3xiRt7bcWmkqKdqJdfhwEtP5p9JThemrRj10PD0GvUvNXAxXMa7';
-const PERCENT_CHANGE = 0.05;
-const MIN_CONTINUE_CHANGE = 0.03;
-const MAX_CORRECTION = 0.01;
-const STABILITY_DURATION = 86400000
+const PERCENT_CHANGE = 0.06; // 7% изменение цены для обнаружения
+const STABILITY_DURATION = 5 * 1000; // 30 секунд для стабильности
+const MAX_CORRECTION = 0.02; // 2% максимальная коррекция цены во время стабильности
+const PROFIT_TARGET = 0.03; // 3% цель по прибыли
+const LOSS_THRESHOLD = 0.10; // 10% изменение против позиции для фиксации убытка
+const CORRECTION_AFTER_PROFIT = 0.01; // 1% коррекция после достижения прибыли
+const LOSS_THRESHOLD_FOR_RECOVERY = 0.05; // 5% порог убытка для отслеживания возврата к точке входа
 
 
 let accountBalance = 0;
-let lastPrices = {};
+let priceHistory = {}; // Хранит историю цен для каждого символа
 let openPositions = {}; // Хранит открытые позиции для каждого символа
-let stableTimestamps = {}; // Хранит время достижения 5% изменения для стабильности
+let potentialEntries = {}; // Хранит символы, ожидающие стабильности после изменения
 let priceUpdates = {}; // Хранит последние обновления цен из WebSocket
 
-// Функция для подписи запроса
+const logFile = path.join(__dirname, 'trade.log');
+
+function log(message) {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}\n`;
+    fs.appendFileSync(logFile, logMessage);
+    console.log(message);
+}
+
 function signQuery(params) {
     const query = Object.keys(params)
         .sort()
@@ -28,12 +41,11 @@ function signQuery(params) {
     return `${query}&signature=${signature}`;
 }
 
-// Функция для получения информации о символе
 async function getSymbolInfo(symbol) {
     try {
         const response = await axios.get(`${BASE_URL}/fapi/v1/exchangeInfo`);
         const symbolInfo = response.data.symbols.find(s => s.symbol === symbol);
-        if (!symbolInfo) throw new Error(`Символ ${symbol} не найден`);
+        if (!symbolInfo) throw new Error(`Symbol ${symbol} not found`);
         const lotSizeFilter = symbolInfo.filters.find(f => f.filterType === 'LOT_SIZE');
         const minNotionalFilter = symbolInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL');
         return {
@@ -42,20 +54,19 @@ async function getSymbolInfo(symbol) {
             minNotional: parseFloat(minNotionalFilter.notional)
         };
     } catch (error) {
-        console.error(`Ошибка при получении параметров символа ${symbol}: ${error.message}`);
+        log(`Error fetching symbol info for ${symbol}: ${error.message}`);
         throw error;
     }
 }
 
-// Функция для округления количества по шагу
 function roundStepSize(quantity, stepSize) {
     const precision = Math.round(-Math.log10(stepSize));
-    const qty = Math.ceil(quantity / stepSize) * stepSize;
+    const qty = Math.floor(quantity / stepSize) * stepSize;
     return parseFloat(qty.toFixed(precision));
 }
 
-// Получение баланса и разделение на 10 частей для торговли
 async function getAccountBalance() {
+    log('Fetching account balance');
     const params = {
         timestamp: Date.now(),
         recvWindow: 5000
@@ -66,81 +77,64 @@ async function getAccountBalance() {
         const response = await axios.get(`${BASE_URL}/fapi/v2/account?${query}`, {
             headers: { 'X-MBX-APIKEY': API_KEY }
         });
-        
         const usdtBalance = response.data.assets.find(asset => asset.asset === 'USDT');
         accountBalance = usdtBalance ? parseFloat(usdtBalance.walletBalance) : 0;
-
-        console.log(`Баланс аккаунта: ${usdtBalance.walletBalance}, Доступно для сделки: ${accountBalance / 10}`);
+        log(`Account balance: ${usdtBalance.walletBalance}, Available for trade: ${accountBalance / 10}`);
     } catch (error) {
-        console.error(`Ошибка при получении баланса: ${error.response ? error.response.data.msg : error.message}`);
+        log(`Error fetching account balance: ${error.response ? error.response.data.msg : error.message}`);
     }
 }
 
-// Получение списка торговых символов с базовой валютой USDT
 async function getSymbolList() {
+    log('Fetching symbol list');
     try {
         const response = await axios.get(`${BASE_URL}/fapi/v1/exchangeInfo`);
         const symbols = response.data.symbols
             .filter(symbol => symbol.quoteAsset === 'USDT' && symbol.status === 'TRADING')
             .map(symbol => symbol.symbol);
-        console.log("Список символов загружен.");
+        log(`Symbol list loaded: ${symbols.length} symbols`);
         return symbols;
     } catch (error) {
-        console.error(`Ошибка при получении списка символов: ${error.message}`);
+        log(`Error fetching symbol list: ${error.message}`);
         return [];
     }
 }
 
-// Функция для открытия позиции (лонг или шорт) на 1/10 баланса
 async function openPosition(symbol, side) {
+    log(`Attempting to open position for ${symbol} с направлением ${side}`);
     if (accountBalance === 0) {
-        console.error(`Недостаточный баланс для открытия позиции по ${symbol}.`);
+        log(`Недостаточно средств для открытия позиции по ${symbol}`);
         return;
     }
 
-    // Используем либо 1/10 баланса, либо минимальную сумму в 100 USDT, в зависимости от того, что больше
     let orderValue = Math.max(accountBalance / 10, 100);
-
-    // Получаем информацию о символе
     const { minQty, stepSize } = await getSymbolInfo(symbol);
-
-    // Получаем текущую цену символа из WebSocket
     const price = priceUpdates[symbol];
     if (!price) {
-        console.error(`Нет текущей цены для символа ${symbol}.`);
+        log(`Нет текущей цены для ${symbol}`);
         return;
     }
 
-    // Рассчитываем минимальное количество для notional >= 100 USDT
     let minQuantity = 100 / price;
-
-    // Округляем до ближайшего допустимого количества вверх
     minQuantity = Math.ceil(minQuantity / stepSize) * stepSize;
     minQuantity = Math.max(minQuantity, minQty);
 
-    // Рассчитываем количество на основе orderValue
     let quantity = orderValue / price;
-
-    // Округляем количество по шагу вверх
     quantity = roundStepSize(quantity, stepSize);
 
-    // Убеждаемся, что quantity >= minQuantity
     if (quantity < minQuantity) {
         quantity = minQuantity;
         orderValue = quantity * price;
     }
 
-    // Вычисляем notional после округления
     let notional = quantity * price;
 
-    // Проверяем, что orderValue не превышает accountBalance
     if (orderValue > accountBalance) {
-        console.error(`Недостаточно средств для открытия позиции по ${symbol}. Требуется ${orderValue.toFixed(2)} USDT, доступно ${accountBalance.toFixed(2)} USDT.`);
+        log(`Недостаточно средств для открытия позиции по ${symbol}. Требуется: ${orderValue.toFixed(2)} USDT, Доступно: ${accountBalance.toFixed(2)} USDT`);
         return;
     }
 
-    // Выводим значения для отладки
-    console.log(`Попытка открыть позицию по ${symbol} с количеством ${quantity} и номинальной стоимостью ${notional.toFixed(2)} USDT.`);
+    log(`Открываем позицию по ${symbol}: Количество ${quantity}, Сумма ${notional.toFixed(2)} USDT`);
 
     const params = {
         symbol,
@@ -156,18 +150,29 @@ async function openPosition(symbol, side) {
         const response = await axios.post(`${BASE_URL}/fapi/v1/order?${query}`, null, {
             headers: { 'X-MBX-APIKEY': API_KEY }
         });
-        console.log(`Открыта ${side} позиция по ${symbol}: количество ${quantity}, номинал ${notional.toFixed(2)} USDT`);
-        openPositions[symbol] = { side, entryPrice: price, quantity };
-        accountBalance -= orderValue; // Уменьшаем баланс на величину позиции
+        log(`Позиция открыта по ${symbol}: Направление ${side}, Количество ${quantity}, Цена входа ${price}`);
+        openPositions[symbol] = {
+            side,
+            entryPrice: price,
+            quantity,
+            openTime: Date.now(),
+            profitTargetReached: false,
+            lossThresholdReached: false, // Новое свойство
+            peakPrice: price
+        };
+        accountBalance -= orderValue;
     } catch (error) {
-        console.error(`Ошибка при открытии позиции для ${symbol}: ${error.response ? error.response.data.msg : error.message}`);
+        log(`Ошибка при открытии позиции по ${symbol}: ${error.response ? error.response.data.msg : error.message}`);
     }
 }
 
-// Закрытие позиции для фиксации прибыли или убытка
 async function closePosition(symbol) {
+    log(`Пытаемся закрыть позицию по ${symbol}`);
     const position = openPositions[symbol];
-    if (!position) return;
+    if (!position) {
+        log(`Нет открытой позиции по ${symbol}`);
+        return;
+    }
 
     const oppositeSide = position.side === 'BUY' ? 'SELL' : 'BUY';
     const quantity = position.quantity;
@@ -185,96 +190,170 @@ async function closePosition(symbol) {
         const response = await axios.post(`${BASE_URL}/fapi/v1/order?${query}`, null, {
             headers: { 'X-MBX-APIKEY': API_KEY }
         });
-        console.log(`Позиция по ${symbol} закрыта.`);
+        log(`Позиция закрыта по ${symbol}`);
         delete openPositions[symbol];
-        // Опционально: обновить баланс аккаунта на основе прибыли или убытка
     } catch (error) {
-        console.error(`Ошибка при закрытии позиции для ${symbol}: ${error.response ? error.response.data.msg : error.message}`);
+        log(`Ошибка при закрытии позиции по ${symbol}: ${error.response ? error.response.data.msg : error.message}`);
     }
 }
 
-// Функция для обработки обновлений цен из WebSocket
 function handlePriceUpdate(data) {
     const symbol = data.s;
     const currentPrice = parseFloat(data.c);
-
     const currentTime = Date.now();
 
     if (!symbol || !currentPrice) return;
 
-    if (lastPrices[symbol]) {
-        const previousPrice = lastPrices[symbol];
-        const percentChange = (currentPrice - previousPrice) / previousPrice;
+    if (!priceHistory[symbol]) {
+        priceHistory[symbol] = [];
+    }
 
-        // Проверка на 5% изменение
-        if (!openPositions[symbol] && Math.abs(percentChange) >= PERCENT_CHANGE) {
-            if (!stableTimestamps[symbol]) {
-                stableTimestamps[symbol] = currentTime;
-            } else if (currentTime - stableTimestamps[symbol] >= STABILITY_DURATION) {
-                const direction = percentChange > 0 ? 'BUY' : 'SELL';
-                console.log(`Символ: ${symbol}, цена изменилась на ${(percentChange * 100).toFixed(2)}%. Открываем позицию ${direction}.`);
+    // Обновляем историю цен (используем для коррекции)
+    priceHistory[symbol].push({ time: currentTime, price: currentPrice });
+    // Удаляем записи старше STABILITY_DURATION
+    priceHistory[symbol] = priceHistory[symbol].filter(entry => currentTime - entry.time <= STABILITY_DURATION);
+
+    // Обновляем последнюю цену
+    priceUpdates[symbol] = currentPrice;
+
+    // Обработка потенциальных входов
+    if (potentialEntries[symbol]) {
+        const entry = potentialEntries[symbol];
+        const percentChangeDuringStability = (currentPrice - entry.startPrice) / entry.startPrice;
+
+        // Проверяем коррекцию
+        const correction = Math.abs(percentChangeDuringStability - entry.percentChange);
+        if (correction <= MAX_CORRECTION) {
+            // Проверяем, прошло ли время стабильности
+            if (currentTime - entry.startTime >= STABILITY_DURATION) {
+                const direction = entry.percentChange > 0 ? 'BUY' : 'SELL';
+                log(`Подтверждено стабильное изменение цены для ${symbol}: ${(entry.percentChange * 100).toFixed(2)}% за ${(STABILITY_DURATION / 1000)} секунд. Открываем позицию ${direction}.`);
                 openPosition(symbol, direction);
-                delete stableTimestamps[symbol];
+                delete potentialEntries[symbol];
             }
         } else {
-            delete stableTimestamps[symbol];
+            // Коррекция превышена, сбрасываем
+            log(`Коррекция цены превышена для ${symbol}. Сбрасываем таймер стабильности.`);
+            delete potentialEntries[symbol];
         }
-
-        // Условия для закрытия позиции
-        if (openPositions[symbol]) {
-            const position = openPositions[symbol];
-            const entryPrice = position.entryPrice;
-            const positionChange = (currentPrice - entryPrice) / entryPrice;
-
-            if (positionChange * percentChange > 0 && Math.abs(positionChange) >= MIN_CONTINUE_CHANGE) {
-                const correction = Math.abs((currentPrice - previousPrice) / currentPrice);
-                if (correction <= MAX_CORRECTION) {
-                    console.log(`Символ: ${symbol}, цена изменилась на ${(positionChange * 100).toFixed(2)}%. Фиксируем прибыль.`);
-                    closePosition(symbol);
-                }
-            }
-
-            if (positionChange * percentChange < 0 && Math.abs(positionChange) >= MIN_CONTINUE_CHANGE) {
-                console.log(`Символ: ${symbol}, цена изменилась на ${(positionChange * 100).toFixed(2)}%. Закрываем с убытком.`);
-                closePosition(symbol);
+    } else {
+        // Проверяем изменение цены на PERCENT_CHANGE или более
+        const oldPriceEntry = priceHistory[symbol][0];
+        if (oldPriceEntry) {
+            const percentChange = (currentPrice - oldPriceEntry.price) / oldPriceEntry.price;
+            if (Math.abs(percentChange) >= PERCENT_CHANGE) {
+                // Начинаем отсчет стабильности
+                potentialEntries[symbol] = {
+                    startTime: currentTime,
+                    startPrice: currentPrice,
+                    percentChange
+                };
+                log(`Обнаружено изменение цены для ${symbol}: ${(percentChange * 100).toFixed(2)}%. Запускаем таймер стабильности.`);
             }
         }
     }
 
-    lastPrices[symbol] = currentPrice;
+    // Обработка открытых позиций
+    if (openPositions[symbol]) {
+        const position = openPositions[symbol];
+        const entryPrice = position.entryPrice;
+        const positionChange = (currentPrice - entryPrice) / entryPrice;
+
+        // Проверяем движение цены в направлении позиции
+        const isProfitable = (position.side === 'BUY' && positionChange > 0) || (position.side === 'SELL' && positionChange < 0);
+
+        // Обновляем peakPrice, если цена движется в нашу пользу
+        if (isProfitable) {
+            if (!position.peakPrice || (position.side === 'BUY' && currentPrice > position.peakPrice) || (position.side === 'SELL' && currentPrice < position.peakPrice)) {
+                position.peakPrice = currentPrice;
+            }
+        }
+
+        // Проверяем, достигла ли цена убытка более 5% после входа в позицию
+        const isLosing = (position.side === 'BUY' && positionChange < 0) || (position.side === 'SELL' && positionChange > 0);
+        if (isLosing && Math.abs(positionChange) >= LOSS_THRESHOLD_FOR_RECOVERY && !position.lossThresholdReached) {
+            position.lossThresholdReached = true;
+            log(`Порог убытка в ${(LOSS_THRESHOLD_FOR_RECOVERY * 100).toFixed(2)}% достигнут для ${symbol}. Отслеживаем возврат к точке входа.`);
+        }
+
+        // Если порог убытка достигнут и цена вернулась к точке входа, закрываем позицию
+        if (position.lossThresholdReached && !position.profitTargetReached) {
+            const isBackToEntry = (position.side === 'BUY' && currentPrice >= entryPrice) || (position.side === 'SELL' && currentPrice <= entryPrice);
+            if (isBackToEntry) {
+                log(`Цена вернулась к точке входа после убытка для ${symbol}. Закрываем позицию.`);
+                closePosition(symbol);
+                return; // Прекращаем дальнейшую обработку для этого символа
+            }
+        }
+
+        // Проверяем движение цены против позиции для фиксации убытка (если цена ушла более чем на 10% в убыток)
+        if (isLosing && Math.abs(positionChange) >= LOSS_THRESHOLD) {
+            log(`Порог убытка достигнут для ${symbol}: ${(positionChange * 100).toFixed(2)}%. Закрываем позицию.`);
+            closePosition(symbol);
+            return;
+        }
+
+        // Проверяем достижение цели прибыли
+        if (!position.profitTargetReached && isProfitable && Math.abs(positionChange) >= PROFIT_TARGET) {
+            position.profitTargetReached = true;
+            position.peakPrice = currentPrice;
+            log(`Цель по прибыли достигнута для ${symbol}: ${(positionChange * 100).toFixed(2)}%. Отслеживаем коррекцию.`);
+        }
+
+        // Отслеживаем коррекцию после достижения цели прибыли
+        if (position.profitTargetReached) {
+            let profitCorrection;
+            if (position.side === 'BUY') {
+                profitCorrection = (position.peakPrice - currentPrice) / position.peakPrice;
+            } else {
+                profitCorrection = (currentPrice - position.peakPrice) / position.peakPrice;
+            }
+
+            if (profitCorrection >= CORRECTION_AFTER_PROFIT) {
+                log(`Коррекция цены после достижения цели прибыли для ${symbol}. Закрываем позицию.`);
+                closePosition(symbol);
+                return; // Прекращаем дальнейшую обработку для этого символа
+            }
+        }
+    }
 }
 
-// Запуск торговой системы с использованием WebSocket
 async function startTrading() {
+    log('Запуск торговой системы');
     await getAccountBalance();
     const symbols = await getSymbolList();
 
-    // Подключение к WebSocket для получения цен
     const streams = symbols.map(symbol => `${symbol.toLowerCase()}@ticker`);
-    const wsUrl = `${WS_BASE_URL}?streams=${streams.join('/')}`;
-    const ws = new WebSocket(wsUrl);
+    const maxStreamsPerConnection = 200;
+    const connections = [];
 
-    ws.on('open', () => {
-        console.log('WebSocket соединение установлено.');
-    });
+    for (let i = 0; i < streams.length; i += maxStreamsPerConnection) {
+        const streamSlice = streams.slice(i, i + maxStreamsPerConnection);
+        const wsUrl = `${WS_BASE_URL}?streams=${streamSlice.join('/')}`;
+        const ws = new WebSocket(wsUrl);
 
-    ws.on('message', (data) => {
-        const parsedData = JSON.parse(data);
-        if (parsedData.stream && parsedData.data) {
-            handlePriceUpdate(parsedData.data);
-            // Обновляем последнюю цену
-            priceUpdates[parsedData.data.s] = parseFloat(parsedData.data.c);
-        }
-    });
+        ws.on('open', () => {
+            log('WebSocket подключение установлено');
+        });
 
-    ws.on('error', (error) => {
-        console.error(`Ошибка WebSocket: ${error.message}`);
-    });
+        ws.on('message', (data) => {
+            const parsedData = JSON.parse(data);
+            if (parsedData.stream && parsedData.data) {
+                handlePriceUpdate(parsedData.data);
+            }
+        });
 
-    ws.on('close', () => {
-        console.log('WebSocket соединение закрыто. Повторное подключение...');
-        setTimeout(startTrading, 5000); // Повторное подключение через 5 секунд
-    });
+        ws.on('error', (error) => {
+            log(`WebSocket ошибка: ${error.message}`);
+        });
+
+        ws.on('close', () => {
+            log('WebSocket подключение закрыто. Переподключаемся...');
+            setTimeout(startTrading, 5000);
+        });
+
+        connections.push(ws);
+    }
 }
 
 startTrading();
