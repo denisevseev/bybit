@@ -1,86 +1,153 @@
 const axios = require('axios');
+const crypto = require('crypto');
+
+// Binance API Configuration
+const BASE_URL = 'https://api.binance.com';
+const API_KEY = 'KA5ZrEOH4cxHCcg1g4eMgAvuDWQGusjLxYyxCT50mKIPl2w3gBfVM8BaLBQXfaK5';
+const SECRET_KEY = 'PACFNMn9Axc7nzXduMARyM6FAW6DJbKzTodvWPkrdbt8DpEqlQFpVdukr9qSJNH2';
+
 const fs = require('fs');
+const path = require('path');
 
-// Константы для подключения к Binance API
-const BASE_URL = 'https://fapi.binance.com';  // Для фьючерсов
-const HISTORICAL_ENDPOINT = '/fapi/v1/klines';
-const SYMBOLS_ENDPOINT = '/fapi/v1/exchangeInfo';
+const logFile = path.join(__dirname, 'spot_trade.log');
 
-async function getAllSymbols() {
+function log(message) {
+    const timestamp = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
+    const logMessage = `[${timestamp}] ${message}\n`;
+
     try {
-        const response = await axios.get(`${BASE_URL}${SYMBOLS_ENDPOINT}`);
-        const symbols = response.data.symbols.map(s => s.symbol);
-        return symbols;
+        if (!fs.existsSync(logFile)) {
+            console.log('Создаём новый лог-файл.');
+            fs.writeFileSync(logFile, '', 'utf8');
+        }
+        fs.appendFileSync(logFile, logMessage, 'utf8');
+        console.log(message);
     } catch (error) {
-        console.error('Ошибка получения символов:', error.message);
-        return [];
+        console.error(`Ошибка записи лога в файл: ${error.message}`);
     }
 }
 
-async function getHistoricalData(symbol) {
-    const params = {
-        symbol,
-        interval: '1h',  // Часовые свечи
-        limit: 100  // Количество свечей для анализа
-    };
-
-    try {
-        const response = await axios.get(`${BASE_URL}${HISTORICAL_ENDPOINT}`, { params });
-        return response.data.map(kline => ({
-            open: parseFloat(kline[1]),
-            high: parseFloat(kline[2]),
-            low: parseFloat(kline[3]),
-            close: parseFloat(kline[4])
-        }));
-    } catch (error) {
-        console.error(`Ошибка получения исторических данных для ${symbol}:`, error.message);
-        return [];
-    }
+// Helper function to sign Binance API queries
+function signQuery(params) {
+    const query = Object.keys(params).sort().map(key => `${key}=${params[key]}`).join('&');
+    const signature = crypto.createHmac('sha256', SECRET_KEY).update(query).digest('hex');
+    return `${query}&signature=${signature}`;
 }
 
-async function analyzeSymbol(symbol) {
+async function getSymbolInfo(symbol) {
     try {
-        const klines = await getHistoricalData(symbol);
-        let growths = 0;
-        let corrections = 0;
+        const response = await axios.get(`${BASE_URL}/api/v3/exchangeInfo`);
+        const symbolInfo = response.data.symbols.find(s => s.symbol === symbol);
 
-        for (let i = 1; i < klines.length; i++) {
-            const previousClose = klines[i - 1].close;
-            const currentClose = klines[i].close;
+        if (!symbolInfo) {
+            log(`Символ ${symbol} не найден на бирже.`);
+            return null;
+        }
 
-            // Проверка на рост цены на 10%
-            if ((currentClose - previousClose) / previousClose >= 0.05) {
-                growths++;
-                const nextClose = klines[i + 1]?.close;
-                // Проверка на коррекцию на 5% после роста
-                if (nextClose && (previousClose - nextClose) / previousClose >= 0.01) {
-                    corrections++;
-                }
+        // Логируем всю информацию о символе для отладки
+        log(`Информация о символе ${symbol}: ${JSON.stringify(symbolInfo)}`);
+
+        const lotSizeFilter = symbolInfo.filters.find(f => f.filterType === 'LOT_SIZE');
+        let minNotionalFilter = symbolInfo.filters.find(f => f.filterType === 'MIN_NOTIONAL');
+
+        // Попытка найти NOTIONAL, если MIN_NOTIONAL отсутствует
+        if (!minNotionalFilter) {
+            const notionalFilter = symbolInfo.filters.find(f => f.filterType === 'NOTIONAL');
+            if (notionalFilter && notionalFilter.minNotional) {
+                minNotionalFilter = notionalFilter;
             }
         }
 
-        console.log(`Анализ символа ${symbol}: Ростов на 10%: ${growths}, Коррекций: ${corrections}`);
-        return { symbol, growths, corrections };
-    } catch (error) {
-        console.error(`Ошибка анализа символа ${symbol}:`, error.message);
-        return null;
-    }
-}
-
-async function analyzeAllSymbols() {
-    const symbols = await getAllSymbols();
-    let results = [];
-
-    for (let symbol of symbols) {
-        const analysis = await analyzeSymbol(symbol);
-        if (analysis) {
-            results.push(analysis);
+        if (!lotSizeFilter || !minNotionalFilter) {
+            log(`Не найдены необходимые фильтры (LOT_SIZE или MIN_NOTIONAL/NOTIONAL) для символа ${symbol}.`);
+            return null;
         }
-    }
 
-    // Записываем результаты в файл
-    fs.writeFileSync('analysis_results.json', JSON.stringify(results, null, 2));
-    console.log('Анализ завершен, результаты записаны в analysis_results.json');
+        return {
+            minQty: parseFloat(lotSizeFilter.minQty),
+            stepSize: parseFloat(lotSizeFilter.stepSize),
+            minNotional: parseFloat(minNotionalFilter.minNotional)
+        };
+    } catch (error) {
+        log(`Ошибка при получении информации о символе ${symbol}: ${error.message}`);
+        throw error;
+    }
 }
 
-analyzeAllSymbols();
+// Function to execute a market BUY order
+async function buyFUNUSDT() {
+    const symbol = 'FUNUSDT';
+    const orderValue = 100; // 100 USDT
+    try {
+        const info = await getSymbolInfo(symbol);
+        const currentPriceResponse = await axios.get(`${BASE_URL}/api/v3/ticker/price?symbol=${symbol}`);
+        const currentPrice = parseFloat(currentPriceResponse.data.price);
+
+        let quantity = Math.floor((orderValue / currentPrice) / info.stepSize) * info.stepSize;
+
+        if (quantity * currentPrice < info.minNotional) {
+            throw new Error(`Сумма сделки меньше минимально допустимой: ${info.minNotional}`);
+        }
+
+        const params = {
+            symbol,
+            side: 'BUY',
+            type: 'MARKET',
+            quantity,
+            recvWindow: 5000,
+            timestamp: Date.now(),
+        };
+
+        const query = signQuery(params);
+        const response = await axios.post(`${BASE_URL}/api/v3/order?${query}`, null, {
+            headers: { 'X-MBX-APIKEY': API_KEY },
+        });
+
+        log(`Ордер на покупку ${symbol} выполнен: ${JSON.stringify(response.data)}`);
+        return { symbol, quantity };
+    } catch (error) {
+        log(`Ошибка при покупке ${symbol}: ${error.response ? JSON.stringify(error.response.data) : error.message}`);
+        throw error;
+    }
+}
+
+// Function to execute a market SELL order
+async function sellFUNUSDT(symbol, quantity) {
+    try {
+        const params = {
+            symbol,
+            side: 'SELL',
+            type: 'MARKET',
+            quantity,
+            recvWindow: 5000,
+            timestamp: Date.now(),
+        };
+
+        const query = signQuery(params);
+        const response = await axios.post(`${BASE_URL}/api/v3/order?${query}`, null, {
+            headers: { 'X-MBX-APIKEY': API_KEY },
+        });
+
+        log(`Ордер на продажу ${symbol} выполнен: ${JSON.stringify(response.data)}`);
+    } catch (error) {
+        log(`Ошибка при продаже ${symbol}: ${error.response ? JSON.stringify(error.response.data) : error.message}`);
+        throw error;
+    }
+}
+
+// Main execution function
+(async function () {
+    try {
+        log('Начинаем покупку FUNUSDT...');
+        const { symbol, quantity } = await buyFUNUSDT();
+
+        log(`Ожидаем 3 секунды перед продажей ${symbol}...`);
+        setTimeout(async () => {
+            log(`Начинаем продажу ${symbol}...`);
+            await sellFUNUSDT(symbol, quantity);
+            log('Тест завершён.');
+        }, 3000);
+    } catch (error) {
+        log(`Тест завершился с ошибкой: ${error.message}`);
+    }
+})();
