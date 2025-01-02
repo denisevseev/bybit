@@ -8,6 +8,7 @@ const BASE_URL = 'https://fapi.binance.com';
 const WS_BASE_URL = 'wss://fstream.binance.com/stream';
 const API_KEY = 'R7nkPfaYEmtCYEgE4kCQQy4WHdkOUOTgyDKHIcvyBP3qVEWCkDIhUuOHYUjhQUG5';
 const SECRET_KEY = 'EZBzLuzGFuNaK3xiRt7bcWmkqKdqJdfhwEtP5p9JThemrRj10PD0GvUvNXAxXMa7';
+
 // Параметры стратегии
 const PERCENT_CHANGE = 0.07;   // 7% изменение цены для обнаружения
 const WAIT_TIME = 2;    // 5 секунд ожидания после изменения цены
@@ -23,6 +24,8 @@ let priceUpdates = {};
 let potentialEntries = {};
 let priceHistory = {};
 let inProgress = {};
+let lastLoggedPercentChange = {}; 
+
 
 const logFile = path.join(__dirname, 'trade.log');
 
@@ -49,12 +52,12 @@ async function checkExistingPosition(symbol) {
         const position = response.data.find(p => p.symbol === symbol && parseFloat(p.positionAmt) !== 0);
         if (position) {
             log(`Уже есть открытая позиция по ${symbol}: Количество ${position.positionAmt}`);
-            return true; 
+            return true;
         }
     } catch (error) {
         log(`Ошибка при проверке существующей позиции по ${symbol}: ${error.message}`);
     }
-    return false; 
+    return false;
 }
 
 function signQuery(params) {
@@ -184,6 +187,8 @@ async function openPosition(symbol, side) {
         timestamp: Date.now()
     };
     const query = signQuery(params);
+
+
 
     if(!hasPosition){
         try {
@@ -329,7 +334,18 @@ function handleOpenPosition(symbol, currentPrice) {
     }
 }
 
-    function handlePriceUpdate(data) {
+
+    function logPriceChange(symbol, percentChange) {
+        const currentPercent = Math.floor(percentChange * 100); // Преобразуем в целое число процентов
+        const lastPercent = lastLoggedPercentChange[symbol] || 0; // Последний зафиксированный процент
+
+        if (currentPercent !== lastPercent) { // Логгируем только если процент изменился
+            log(`Символ: ${symbol}, Изменение цены: ${currentPercent}%`);
+            lastLoggedPercentChange[symbol] = currentPercent; // Обновляем последний зафиксированный процент
+        }
+    }
+
+    async function handlePriceUpdate(data) {
         const symbol = data.s;
         const currentPrice = parseFloat(data.c);
         const currentTime = Date.now();
@@ -340,9 +356,6 @@ function handleOpenPosition(symbol, currentPrice) {
 
         if (openPositions[symbol]) {
             handleOpenPosition(symbol, currentPrice);
-        }
-
-        if (openPositions[symbol] || potentialEntries[symbol]) {
             return;
         }
 
@@ -350,11 +363,13 @@ function handleOpenPosition(symbol, currentPrice) {
             priceHistory[symbol] = { time: currentTime, price: currentPrice };
             return;
         }
+       
+
         const oldPriceEntry = priceHistory[symbol];
         const percentChange = (currentPrice - oldPriceEntry.price) / oldPriceEntry.price;
 
-        if(percentChange > 0.5){
-            console.log(symbol, percentChange)
+        if (Math.abs(percentChange) >= 0.01) { // 1% изменение цены
+            logPriceChange(symbol, percentChange);
         }
         
 
@@ -371,10 +386,11 @@ function handleOpenPosition(symbol, currentPrice) {
             };
 
             log(`Обнаружено изменение цены для ${symbol}: ${(percentChange * 100).toFixed(2)}%. Начинаем отслеживание удержания цены для возможного входа в позицию ${direction}.`);
-        } else {
-            if (currentTime - oldPriceEntry.time >= WAIT_TIME) {
-                priceHistory[symbol] = { time: currentTime, price: currentPrice };
-            }
+            return;
+        }
+        
+        if (currentTime - oldPriceEntry.time >= WAIT_TIME * 1000) {
+            priceHistory[symbol] = { time: currentTime, price: currentPrice };
         }
 
         if (potentialEntries[symbol]) {
@@ -384,10 +400,10 @@ function handleOpenPosition(symbol, currentPrice) {
             let allowedMinPrice, allowedMaxPrice;
             if (entry.direction === 'BUY') {
                 allowedMinPrice = entry.thresholdPrice * (1 - MAX_CORRECTION);
-                console.log(allowedMinPrice,  'its allowedMinPrice')
+                
             } else {
                 allowedMaxPrice = entry.thresholdPrice * (1 + MAX_CORRECTION);
-                console.log(allowedMaxPrice, 'its allowedMaxPrice')
+            
             }
 
             let conditionsMet = true;
@@ -407,14 +423,14 @@ function handleOpenPosition(symbol, currentPrice) {
                 return;
             }
 
-            console.log(`Цена по ${symbol}  в ${(PERCENT_CHANGE * 100).toFixed(2)}% в течение ${WAIT_TIME/1000} секунд.`);
-            if (elapsedTime >= WAIT_TIME) {
+           
+            if (elapsedTime >= WAIT_TIME * 1000) {
                 if ((entry.direction === 'BUY' && currentPrice >= entry.thresholdPrice) ||
                     (entry.direction === 'SELL' && currentPrice <= entry.thresholdPrice)) {
                 if (!inProgress[symbol]) {
                         inProgress[symbol] = true;
                         delete potentialEntries[symbol]; // Удаляем сразу, чтобы повторно не попробовать открыть позицию
-                        openPosition(symbol, entry.direction)
+                         await openPosition(symbol, entry.direction)
                         .finally(() => {
                             inProgress[symbol] = false; // После завершения попытки открытия позиции, снимаем флаг
                         });
